@@ -5,13 +5,30 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./lib.sh
 
 DRY_RUN=0
+FORCE_NEW=0
 PICK=""
 while (($#)); do
     case "$1" in
         --dry-run) DRY_RUN=1 ;;
+        --new) FORCE_NEW=1 ;;
         --pick)
             shift
             PICK="${1:-}"
+            [[ -n "$PICK" ]] || die "--pick needs a number or A"
+            ;;
+        -h | --help)
+            cat >&2 <<'EOF'
+Usage: ./1-launch.sh [--new] [--dry-run] [--pick N|A]
+
+  --new       force a fresh rental (do not reuse a live instance)
+  --dry-run   print the create command without renting
+  --pick N    take offer row N from the table (non-interactive)
+  --pick A    auto-pick the cheapest offer (non-interactive)
+
+Without --pick, the offer table is shown and you can type a number or A
+(default) for the cheapest.
+EOF
+            exit 0
             ;;
         *) die "unknown argument: $1" ;;
     esac
@@ -48,7 +65,7 @@ for o in offers[:limit]:
 }
 
 search_offers() {
-    local rows=() i gpu vram disk price dlperf net rel loc
+    local rows=() i gpu vram disk price dlperf net rel loc choice index=1
 
     c_yellow "searching offers: $OFFER_QUERY"
     mapfile -t rows < <("$VAST_BIN" search offers "$OFFER_QUERY" -o dph_total --raw 2>/dev/null | format_offers)
@@ -63,44 +80,39 @@ search_offers() {
     done
     printf '\n' >&2
 
-    local index=1
-    [[ -n "$PICK" ]] && index="$PICK"
-    [[ "$index" =~ ^[0-9]+$ ]] && ((index >= 1 && index <= ${#rows[@]})) \
-        || die "--pick must be between 1 and ${#rows[@]}"
+    if [[ -n "$PICK" ]]; then
+        choice="$PICK"
+    else
+        read -r -p "pick offer #, or A for auto (cheapest) [A]: " choice </dev/tty
+    fi
+
+    # empty / A / a => cheapest (row 1); otherwise a 1-based table index
+    case "${choice,,}" in
+        "" | a | auto) index=1 ;;
+        *)
+            [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#rows[@]})) \
+                || die "pick a number 1-${#rows[@]}, or A for auto"
+            index="$choice"
+            ;;
+    esac
 
     IFS=$'\t' read -r OFFER_ID _ _ _ OFFER_PRICE _ _ _ OFFER_LOCATION <<<"${rows[$((index - 1))]}"
-    c_green "selected offer $OFFER_ID (\$$OFFER_PRICE/hr, $OFFER_LOCATION)"
-}
-
-build_env() {
-    local portal
-    portal="localhost:1111:11111:/:Instance Portal"
-    portal="$portal|localhost:7860:17860:/:Model UI"
-    portal="$portal|localhost:8000:18000:/docs:vLLM API"
-    portal="$portal|localhost:8265:28265:/:Ray Dashboard"
-    portal="$portal|localhost:8080:18080:/:Jupyter"
-    portal="$portal|localhost:8080:8080:/terminals/1:Jupyter Terminal"
-
-    ENV_BLOCK="-p 1111:1111 -p 7860:7860 -p 8080:8080 -p 8000:8000 -p 8265:8265 -p 10100:10100 -p 10200:10200"
-    ENV_BLOCK="$ENV_BLOCK -e OPEN_BUTTON_PORT=\"1111\" -e OPEN_BUTTON_TOKEN=\"1\""
-    ENV_BLOCK="$ENV_BLOCK -e JUPYTER_DIR=\"/\" -e DATA_DIRECTORY=\"/workspace/\""
-    ENV_BLOCK="$ENV_BLOCK -e PORTAL_CONFIG=\"$portal\""
-    ENV_BLOCK="$ENV_BLOCK -e VLLM_MODEL=\"$MODEL\""
-    ENV_BLOCK="$ENV_BLOCK -e VLLM_ARGS=\"$BOOT_VLLM_ARGS\""
-    ENV_BLOCK="$ENV_BLOCK -e AUTO_PARALLEL=\"true\" -e RAY_ADDRESS=\"127.0.0.1\""
-    ENV_BLOCK="$ENV_BLOCK -e RAY_ARGS=\"--head --port 6379 --dashboard-host 127.0.0.1 --dashboard-port 28265\""
+    if ((index == 1)) && [[ -z "$PICK" || "${PICK,,}" =~ ^(a|auto)?$ ]]; then
+        c_green "auto-selected offer $OFFER_ID (\$$OFFER_PRICE/hr, $OFFER_LOCATION)"
+    else
+        c_green "selected offer #$index $OFFER_ID (\$$OFFER_PRICE/hr, $OFFER_LOCATION)"
+    fi
 }
 
 create_instance() {
     local out id
     local -a cmd=(
         "$VAST_BIN" create instance "$OFFER_ID"
-        --image "$IMAGE"
-        --env "$ENV_BLOCK"
-        --onstart-cmd entrypoint.sh
+        --template_hash "$TEMPLATE_HASH"
         --disk "$DISK_GB"
-        --jupyter --ssh --direct
     )
+
+    c_yellow "template $TEMPLATE_HASH  image=$IMAGE  model=$MODEL  disk=${DISK_GB}GB  gpu=1x RTX 5090"
 
     if ((DRY_RUN)); then
         c_yellow "dry run, would execute:"
@@ -118,11 +130,45 @@ create_instance() {
 
     state_set instance_id "$id"
     state_set offer_price "$OFFER_PRICE"
+    state_set template_hash "$TEMPLATE_HASH"
+    INSTANCE_ID="$id"
     c_green "instance $id created (\$$OFFER_PRICE/hr); next: ./2-serve.sh"
+}
+
+# reuse a live contract when possible so re-running launch does not double-bill
+reuse_existing() {
+    ((FORCE_NEW)) && return 1
+
+    if ! find_reusable_instance; then
+        return 1
+    fi
+
+    local status price
+    status=$(instance_field actual_status)
+    price=$(instance_field dph_total)
+
+    if ((DRY_RUN)); then
+        c_yellow "dry run, would reuse instance $INSTANCE_ID (status=$status)"
+        return 0
+    fi
+
+    state_set instance_id "$INSTANCE_ID"
+    if [[ -n "$price" ]]; then
+        price=$(LC_ALL=C printf '%.3f' "$price")
+        state_set offer_price "$price"
+    fi
+    record_proxy_ports
+    c_green "reusing instance $INSTANCE_ID (status=$status${price:+, \$$price/hr}); next: ./2-serve.sh"
+    return 0
 }
 
 ensure_cli
 need python3
+if reuse_existing; then
+    exit 0
+fi
 search_offers
-build_env
 create_instance
+if ((!DRY_RUN)); then
+    record_proxy_ports
+fi

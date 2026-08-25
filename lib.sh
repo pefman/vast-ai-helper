@@ -1,39 +1,25 @@
 #!/usr/bin/env bash
-# shared config and helpers for the vast.ai 5090 + vLLM flow
+# shared config and helpers for the vast.ai single-5090 + SGLang flow
 
 VAST_BIN="vastai"
 VAST_KEY_FILE="$HOME/.config/vastai/vast_api_key"
 
-IMAGE="vastai/vllm:v0.27.1-cuda-12.9"
-MODEL="unsloth/Qwen3.8-27B-NVFP4"
-DISK_GB=70
+# Hardcoded Vast template: SGLang + RadixArk Qwen3.8-27B-NVFP4 + EAGLE
+# https://cloud.vast.ai/?template_id=12c8baa67b6b269becbc51634b6c740c&instanceDiskSizeMin=65
+TEMPLATE_HASH="12c8baa67b6b269becbc51634b6c740c"
+IMAGE="vastai/sglang:v0.5.17-cuda-13.0"
+MODEL="RadixArk/Qwen3.8-27B-NVFP4"
+DISK_GB=65
 REMOTE_PORT=18000
 LOCAL_PORT=8000
-TARGET_TPS=60
 
-OFFER_QUERY='gpu_name=RTX_5090 num_gpus=1 cuda_max_good>=12.9 disk_space>=70 rented=False reliability>0.95 inet_down>=500 dlperf>180'
+# Locked to a single RTX 5090. Disk floor matches instanceDiskSizeMin=65.
+OFFER_QUERY='gpu_name=RTX_5090 num_gpus=1 cuda_max_good>=13.0 disk_space>=65 rented=False reliability>0.95 inet_down>=500 dlperf>180'
 OFFER_LIST_MAX=10
 
-VLLM_COMMON_ARGS="--host 127.0.0.1 --port $REMOTE_PORT --download-dir /workspace/models --trust-remote-code --tensor-parallel-size 1 --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 --enable-chunked-prefill --max-num-batched-tokens 4096"
-
-# boot config for `vastai create`: cuda graphs on (no --enforce-eager) but no JSON
-# flags, since the vast --env parser mangles nested quotes. 2-serve.sh tunes from here.
-BOOT_VLLM_ARGS="$VLLM_COMMON_ARGS --max-num-seqs 4 --max-model-len 32768 --gpu-memory-utilization 0.82 --enable-prefix-caching"
-
-# tuning ladder, best first; 2-serve.sh stops at the first rung beating TARGET_TPS.
-# fp8 kv cache is only used on the last rung: this model is a mamba/attention hybrid
-# and fp8 kv + prefix caching + mtp is the most likely source of the earlier crash.
-rung_args() {
-    case "$1" in
-        A) echo "$VLLM_COMMON_ARGS --max-num-seqs 4 --max-model-len 32768 --gpu-memory-utilization 0.82 --enable-prefix-caching --compilation-config '{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}' --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}'" ;;
-        B) echo "$VLLM_COMMON_ARGS --max-num-seqs 4 --max-model-len 24576 --gpu-memory-utilization 0.78 --enable-prefix-caching --compilation-config '{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}' --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}'" ;;
-        C) echo "$VLLM_COMMON_ARGS --max-num-seqs 4 --max-model-len 24576 --gpu-memory-utilization 0.80 --enable-prefix-caching --compilation-config '{\"cudagraph_mode\":\"FULL_DECODE_ONLY\"}' --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":2}'" ;;
-        D) echo "$VLLM_COMMON_ARGS --max-num-seqs 4 --max-model-len 32768 --gpu-memory-utilization 0.85 --enable-prefix-caching --enforce-eager --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}'" ;;
-        E) echo "$VLLM_COMMON_ARGS --max-num-seqs 4 --max-model-len 16384 --gpu-memory-utilization 0.85 --kv-cache-dtype fp8 --enforce-eager" ;;
-        *) return 1 ;;
-    esac
-}
-RUNGS=(A B C D E)
+# Template ships these (kept here for docs / reuse matching only):
+# SGLANG_MODEL=RadixArk/Qwen3.8-27B-NVFP4
+# SGLANG_ARGS=... flashinfer ... EAGLE steps=3 topk=1 draft=4 mem=0.90 kv=fp8_e4m3 ...
 
 STATE_DIR="$HOME/.cache/vast-helper"
 STATE_FILE="$STATE_DIR/state"
@@ -136,6 +122,114 @@ require_instance() {
     INSTANCE_ID=$(state_get instance_id) \
         || die "no instance in $STATE_FILE; run ./1-launch.sh first"
     [[ "$INSTANCE_ID" =~ ^[0-9]+$ ]] || die "bad instance id in state: $INSTANCE_ID"
+}
+
+# statuses that mean the contract is still ours and worth attaching to
+instance_is_reusable_status() {
+    case "$1" in
+        running|loading|created|pending) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# prints matching live instances as: id<TAB>status<TAB>image<TAB>model
+list_candidate_instances() {
+    "$VAST_BIN" show instances --raw 2>/dev/null | python3 -c '
+import json, sys
+
+want_image = sys.argv[1]
+want_model = sys.argv[2]
+try:
+    rows = json.load(sys.stdin)
+except ValueError:
+    rows = []
+
+def env_get(row, key):
+    env = row.get("extra_env") or {}
+    if isinstance(env, dict):
+        if key in env:
+            return str(env.get(key) or "")
+        # vast sometimes stores docker -e flags as bare KEY=value entries
+        for k, v in env.items():
+            ks = str(k)
+            if ks == key or ks.endswith("/" + key) or ks.endswith(" " + key):
+                return str(v or "")
+            if ks.startswith(key + "="):
+                return ks.split("=", 1)[1]
+    return ""
+
+for row in rows:
+    iid = row.get("id")
+    status = (row.get("actual_status") or row.get("intended_status") or "").strip()
+    image = str(row.get("image") or row.get("image_uuid") or "")
+    model = env_get(row, "SGLANG_MODEL") or env_get(row, "VLLM_MODEL")
+    if not iid:
+        continue
+    if want_image and want_image.split(":")[0] not in image:
+        continue
+    if want_model and model and model != want_model:
+        continue
+    print("\t".join([str(iid), status, image.replace("\t", " "), model.replace("\t", " ")]))
+' "$IMAGE" "$MODEL"
+}
+
+# sets INSTANCE_ID from state or a live matching instance; returns 0 if found
+find_reusable_instance() {
+    local id status image model
+    local -a rows=()
+
+    id=$(state_get instance_id 2>/dev/null || true)
+    if [[ "$id" =~ ^[0-9]+$ ]]; then
+        INSTANCE_ID="$id"
+        status=$(instance_field actual_status)
+        if instance_is_reusable_status "$status"; then
+            return 0
+        fi
+        c_yellow "state instance $id is not reusable (status=${status:-gone}); looking for another"
+    fi
+
+    mapfile -t rows < <(list_candidate_instances)
+    for line in "${rows[@]}"; do
+        IFS=$'\t' read -r id status image model <<<"$line"
+        if instance_is_reusable_status "$status"; then
+            INSTANCE_ID="$id"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# records local tunnel port + direct host proxy mapping for the portal vLLM port
+record_proxy_ports() {
+    local public_ip host_port
+    state_set local_port "$LOCAL_PORT"
+
+    public_ip=$(instance_field public_ipaddr)
+    host_port=$("$VAST_BIN" show instances --raw 2>/dev/null | python3 -c '
+import json, sys
+iid, container_port = int(sys.argv[1]), sys.argv[2]
+try:
+    rows = json.load(sys.stdin)
+except ValueError:
+    rows = []
+key = container_port + "/tcp"
+for row in rows:
+    if row.get("id") != iid:
+        continue
+    ports = row.get("ports") or {}
+    entries = ports.get(key) or []
+    if entries and isinstance(entries, list):
+        print(entries[0].get("HostPort") or "")
+    break
+' "$INSTANCE_ID" "8000")
+
+    state_set public_ip "$public_ip"
+    state_set host_proxy_port "$host_port"
+
+    c_green "local proxy port for last step: $LOCAL_PORT  (http://localhost:$LOCAL_PORT/v1)"
+    if [[ -n "$public_ip" && -n "$host_port" ]]; then
+        c_yellow "direct host proxy (portal): http://$public_ip:$host_port/  (may require portal auth)"
+    fi
 }
 
 # resolves SSH_HOST/SSH_PORT from `vastai ssh-url`, which also works on proxy-only hosts

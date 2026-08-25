@@ -23,10 +23,20 @@ main() {
         sleep 8
     done
 
+    local local_port host_proxy public_ip
+    local_port=$(state_get local_port 2>/dev/null || true)
+    [[ "$local_port" =~ ^[0-9]+$ ]] && LOCAL_PORT="$local_port"
+    host_proxy=$(state_get host_proxy_port 2>/dev/null || true)
+    public_ip=$(state_get public_ip 2>/dev/null || true)
+
     trap on_exit EXIT
     c_green "tunnel up:  http://localhost:$LOCAL_PORT/v1"
+    c_green "local proxy port: $LOCAL_PORT"
     c_green "model:      $MODEL"
     c_green "api key:    any non-empty value, e.g. x"
+    if [[ -n "$public_ip" && -n "$host_proxy" ]]; then
+        c_yellow "direct host proxy: http://$public_ip:$host_proxy/  (portal; may need auth)"
+    fi
     c_yellow "ctrl+c to close the tunnel"
 
     ssh -p "$SSH_PORT" "${ssh_opts[@]}" \
