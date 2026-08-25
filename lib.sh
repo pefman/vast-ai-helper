@@ -1,25 +1,96 @@
 #!/usr/bin/env bash
-# shared config and helpers for the vast.ai single-5090 + SGLang flow
+# shared config and helpers for the vast.ai profile-based launch flow
 
 VAST_BIN="vastai"
 VAST_KEY_FILE="$HOME/.config/vastai/vast_api_key"
 
-# Hardcoded Vast template: SGLang + RadixArk Qwen3.8-27B-NVFP4 + EAGLE
-# https://cloud.vast.ai/?template_id=12c8baa67b6b269becbc51634b6c740c&instanceDiskSizeMin=65
-TEMPLATE_HASH="12c8baa67b6b269becbc51634b6c740c"
-IMAGE="vastai/sglang:v0.5.17-cuda-13.0"
-MODEL="RadixArk/Qwen3.8-27B-NVFP4"
+# Ordered profile ids. Add new ones here and in apply_profile() / profile_desc().
+PROFILES=(qwen38-sglang)
+DEFAULT_PROFILE="qwen38-sglang"
+
+# Active profile fields (filled by apply_profile).
+PROFILE=""
+PROFILE_DESC=""
+TEMPLATE_HASH=""
+IMAGE=""
+MODEL=""
 DISK_GB=65
+OFFER_QUERY=""
+SGLANG_ARGS=""
+CREATE_ENV=""
 REMOTE_PORT=18000
 LOCAL_PORT=8000
-
-# Locked to a single RTX 5090. Disk floor matches instanceDiskSizeMin=65.
-OFFER_QUERY='gpu_name=RTX_5090 num_gpus=1 cuda_max_good>=13.0 disk_space>=65 rented=False reliability>0.95 inet_down>=500 dlperf>180'
 OFFER_LIST_MAX=10
 
-# Template ships these (kept here for docs / reuse matching only):
-# SGLANG_MODEL=RadixArk/Qwen3.8-27B-NVFP4
-# SGLANG_ARGS=... flashinfer ... EAGLE steps=3 topk=1 draft=4 mem=0.90 kv=fp8_e4m3 ...
+# Claude Code injects mid-conversation system/developer messages; stock Qwen3.8
+# chat templates raise on those. Patched jinja is uploaded to the instance and
+# passed to SGLang via /etc/sglang-args.conf (appended by the Vast sglang.sh).
+CHAT_TEMPLATE_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/chat-templates/qwen38-claude.jinja"
+CHAT_TEMPLATE_REMOTE="/workspace/qwen38-claude.jinja"
+SGLANG_CHAT_TEMPLATE_ARG="--chat-template ${CHAT_TEMPLATE_REMOTE}"
+
+profile_desc() {
+    case "$1" in
+        qwen38-sglang) printf '%s' "SGLang + RadixArk Qwen3.8-27B-NVFP4 + EAGLE (1x RTX 5090)" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# Apply a named profile into the globals above. Add future templates as new cases.
+apply_profile() {
+    local id="$1"
+    case "$id" in
+        qwen38-sglang)
+            # Template: https://cloud.vast.ai/?template_id=12c8baa67b6b269becbc51634b6c740c&instanceDiskSizeMin=65
+            # Stock template uses context 65536 + mem 0.90 which OOMs the hybrid GDN
+            # state pool on a 32GB 5090 once EAGLE draft weights load. Profile args
+            # (passed at create via --env) match the SGLang cookbook RTX 5090
+            # envelope (32k ctx, mem 0.93, bs=1) and enable Prometheus /metrics.
+            PROFILE="qwen38-sglang"
+            PROFILE_DESC="$(profile_desc "$id")"
+            TEMPLATE_HASH="12c8baa67b6b269becbc51634b6c740c"
+            IMAGE="vastai/sglang:v0.5.17-cuda-13.0"
+            MODEL="RadixArk/Qwen3.8-27B-NVFP4"
+            DISK_GB=65
+            OFFER_QUERY='gpu_name=RTX_5090 num_gpus=1 cuda_max_good>=13.0 disk_space>=65 rented=False reliability>0.95 inet_down>=500 dlperf>180'
+            SGLANG_ARGS='--trust-remote-code --attention-backend flashinfer --reasoning-parser qwen3 --tool-call-parser qwen3_coder --download-dir /workspace/models --host 127.0.0.1 --port 18000 --context-length 32768 --mem-fraction-static 0.93 --kv-cache-dtype fp8_e4m3 --chunked-prefill-size 2048 --max-running-requests 1 --cuda-graph-max-bs 1 --mm-feature-transport cpu --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --enable-linear-replayssm-spec --enable-metrics'
+            REMOTE_PORT=18000
+            LOCAL_PORT=8000
+            ;;
+        *)
+            die "unknown profile: $id (known: ${PROFILES[*]})"
+            ;;
+    esac
+}
+
+# Docker --env for `vastai create`. With --template_hash, --env replaces the
+# template env, so this keeps the stock portal/ports and injects profile args
+# (context/mem pins, --enable-metrics, etc.) at create time — no post-boot restart.
+build_create_env() {
+    CREATE_ENV=""
+    [[ -n "$SGLANG_ARGS" ]] || return 0
+
+    local portal
+    portal='localhost:1111:11111:/:Instance Portal|localhost:7860:17860:/:Model UI|localhost:8000:18000:/docs:SGLang API|localhost:8080:18080:/:Jupyter|localhost:8080:8080:/terminals/1:Jupyter Terminal'
+    CREATE_ENV="-p 1111:1111 -p 7860:7860 -p 8080:8080 -p 8000:8000 -p 8265:8265 -p 10100:10100 -p 10200:10200"
+    CREATE_ENV="$CREATE_ENV -e OPEN_BUTTON_PORT=\"1111\" -e OPEN_BUTTON_TOKEN=\"1\""
+    CREATE_ENV="$CREATE_ENV -e JUPYTER_DIR=\"/\" -e DATA_DIRECTORY=\"/workspace/\""
+    CREATE_ENV="$CREATE_ENV -e PORTAL_CONFIG=\"$portal\""
+    CREATE_ENV="$CREATE_ENV -e SGLANG_MODEL=\"$MODEL\""
+    CREATE_ENV="$CREATE_ENV -e SGLANG_ARGS=\"$SGLANG_ARGS\""
+    CREATE_ENV="$CREATE_ENV -e AUTO_PARALLEL=false"
+}
+
+# Restore the profile chosen at launch (state), else the default.
+load_active_profile() {
+    local p
+    p=$(state_get profile 2>/dev/null || true)
+    if [[ -n "$p" ]]; then
+        apply_profile "$p"
+    else
+        apply_profile "$DEFAULT_PROFILE"
+    fi
+}
 
 STATE_DIR="$HOME/.cache/vast-helper"
 STATE_FILE="$STATE_DIR/state"
@@ -119,6 +190,7 @@ state_get() {
 }
 
 require_instance() {
+    load_active_profile
     INSTANCE_ID=$(state_get instance_id) \
         || die "no instance in $STATE_FILE; run ./1-launch.sh first"
     [[ "$INSTANCE_ID" =~ ^[0-9]+$ ]] || die "bad instance id in state: $INSTANCE_ID"
@@ -132,13 +204,23 @@ instance_is_reusable_status() {
     esac
 }
 
-# prints matching live instances as: id<TAB>status<TAB>image<TAB>model
-list_candidate_instances() {
+# prints live instances that match any known profile:
+# id<TAB>status<TAB>image<TAB>model<TAB>profile<TAB>$/hr
+list_live_instances() {
+    local id images="" models=""
+    for id in "${PROFILES[@]}"; do
+        apply_profile "$id"
+        images+="${IMAGE%%:*}"$'\n'
+        models+="${MODEL}"$'\n'
+    done
+    apply_profile "$DEFAULT_PROFILE"
+
     "$VAST_BIN" show instances --raw 2>/dev/null | python3 -c '
 import json, sys
 
-want_image = sys.argv[1]
-want_model = sys.argv[2]
+images = [x for x in sys.argv[1].split("\n") if x]
+models = [x for x in sys.argv[2].split("\n") if x]
+profiles = [x for x in sys.argv[3].split("\n") if x]
 try:
     rows = json.load(sys.stdin)
 except ValueError:
@@ -149,7 +231,6 @@ def env_get(row, key):
     if isinstance(env, dict):
         if key in env:
             return str(env.get(key) or "")
-        # vast sometimes stores docker -e flags as bare KEY=value entries
         for k, v in env.items():
             ks = str(k)
             if ks == key or ks.endswith("/" + key) or ks.endswith(" " + key):
@@ -158,45 +239,51 @@ def env_get(row, key):
                 return ks.split("=", 1)[1]
     return ""
 
+def match_profile(image, model):
+    for img, mod, prof in zip(images, models, profiles):
+        if img and img not in image:
+            continue
+        if mod and model and model != mod:
+            continue
+        return prof
+    return ""
+
+reusable = {"running", "loading", "created", "pending"}
 for row in rows:
     iid = row.get("id")
     status = (row.get("actual_status") or row.get("intended_status") or "").strip()
+    if not iid or status not in reusable:
+        continue
     image = str(row.get("image") or row.get("image_uuid") or "")
     model = env_get(row, "SGLANG_MODEL") or env_get(row, "VLLM_MODEL")
-    if not iid:
+    prof = match_profile(image, model)
+    if not prof:
         continue
-    if want_image and want_image.split(":")[0] not in image:
-        continue
-    if want_model and model and model != want_model:
-        continue
-    print("\t".join([str(iid), status, image.replace("\t", " "), model.replace("\t", " ")]))
-' "$IMAGE" "$MODEL"
+    price = row.get("dph_total") or 0
+    print("\t".join([
+        str(iid),
+        status,
+        image.replace("\t", " "),
+        model.replace("\t", " "),
+        prof,
+        "{:.3f}".format(float(price)),
+    ]))
+' "$images" "$models" "$(printf '%s\n' "${PROFILES[@]}")"
 }
 
-# sets INSTANCE_ID from state or a live matching instance; returns 0 if found
-find_reusable_instance() {
-    local id status image model
-    local -a rows=()
-
-    id=$(state_get instance_id 2>/dev/null || true)
-    if [[ "$id" =~ ^[0-9]+$ ]]; then
-        INSTANCE_ID="$id"
-        status=$(instance_field actual_status)
-        if instance_is_reusable_status "$status"; then
-            return 0
-        fi
-        c_yellow "state instance $id is not reusable (status=${status:-gone}); looking for another"
+# Bind globals to a live instance and remember it in state.
+attach_instance() {
+    local id="$1" profile="$2" image="$3" model="$4" price="$5"
+    INSTANCE_ID="$id"
+    apply_profile "$profile"
+    [[ -n "$model" ]] && MODEL="$model"
+    state_set instance_id "$INSTANCE_ID"
+    state_set profile "$PROFILE"
+    state_set template_hash "$TEMPLATE_HASH"
+    if [[ -n "$price" ]]; then
+        price=$(LC_ALL=C printf '%.3f' "$price")
+        state_set offer_price "$price"
     fi
-
-    mapfile -t rows < <(list_candidate_instances)
-    for line in "${rows[@]}"; do
-        IFS=$'\t' read -r id status image model <<<"$line"
-        if instance_is_reusable_status "$status"; then
-            INSTANCE_ID="$id"
-            return 0
-        fi
-    done
-    return 1
 }
 
 # records local tunnel port + direct host proxy mapping for the portal vLLM port
@@ -254,6 +341,33 @@ rsh() {
     ssh -p "$SSH_PORT" "${ssh_opts[@]}" "$SSH_USER@$SSH_HOST" "$@"
 }
 
+# Upload the Claude-compatible Qwen chat template and make SGLang use it.
+# Safe to call repeatedly. Restarts sglang only when the running server is not
+# already using --chat-template pointing at CHAT_TEMPLATE_REMOTE.
+ensure_chat_template() {
+    [[ -n "${SSH_HOST:-}" && -n "${SSH_PORT:-}" ]] || die "ensure_chat_template: ssh not resolved"
+    [[ -f "$CHAT_TEMPLATE_FILE" ]] || die "missing chat template: $CHAT_TEMPLATE_FILE"
+
+    c_yellow "ensuring Claude-compatible chat template on instance..."
+    scp -P "$SSH_PORT" "${ssh_opts[@]}" \
+        "$CHAT_TEMPLATE_FILE" "$SSH_USER@$SSH_HOST:$CHAT_TEMPLATE_REMOTE" >/dev/null
+
+    # Vast's sglang.sh appends contents of /etc/sglang-args.conf to the serve cmdline.
+    rsh "bash --noprofile --norc -c 'printf \"%s\\n\" \"$SGLANG_CHAT_TEMPLATE_ARG\" > /etc/sglang-args.conf'"
+
+    if rsh "bash --noprofile --norc -c '
+        pid=\$(pgrep -n -f \"sglang serve\" || true)
+        [ -n \"\$pid\" ] || exit 1
+        tr \"\\0\" \" \" < /proc/\$pid/cmdline | grep -q -- \"--chat-template ${CHAT_TEMPLATE_REMOTE}\"
+      '" >/dev/null 2>&1; then
+        c_green "SGLang already using $CHAT_TEMPLATE_REMOTE"
+        return 0
+    fi
+
+    c_yellow "restarting SGLang to pick up --chat-template..."
+    rsh "bash --noprofile --norc -c 'supervisorctl restart sglang'" >/dev/null
+}
+
 instance_field() {
     "$VAST_BIN" show instances --raw 2>/dev/null \
         | python3 -c '
@@ -279,3 +393,5 @@ destroy_prompt() {
         c_yellow "left running. destroy later with: $VAST_BIN destroy instance $INSTANCE_ID"
     fi
 }
+
+

@@ -46,39 +46,69 @@ server_ready() {
 }
 
 sglang_log_snip() {
-    rsh 'for f in /var/log/portal/sglang.log /workspace/sglang.log /var/log/portal/*.log; do
-             [ -f "$f" ] || continue
-             echo "=== $f ==="
-             tail -n 80 "$f"
-         done' 2>/dev/null || true
+    rsh 'f=/var/log/portal/sglang.log
+         if [ -f "$f" ]; then tail -n 100 "$f"; else echo "(no sglang.log yet)"; fi' 2>/dev/null || true
 }
 
+# True when the template's sglang supervisor wrapper or the serve process is up.
 sglang_alive() {
-    rsh 'pgrep -af "sglang" | grep -Eiv "pgrep|grep" >/dev/null' >/dev/null 2>&1
+    rsh 'pgrep -f "/opt/supervisor-scripts/sglang.sh|sglang serve" >/dev/null' >/dev/null 2>&1
 }
 
-# returns 0 when the api answers, 1 when the process died; FAIL_REASON holds the tail
+# True when supervisor reports a hard failure (not merely "not started yet").
+sglang_crashed() {
+    rsh 'st=$(supervisorctl status sglang 2>/dev/null || true)
+         case "$st" in *FATAL*|*BACKOFF*|*EXITED*) exit 0 ;; esac
+         if ! pgrep -f "/opt/supervisor-scripts/sglang.sh|sglang serve" >/dev/null; then
+             if [ -f /var/log/portal/sglang.log ] && \
+                grep -qE "Traceback|CUDA out of memory" /var/log/portal/sglang.log; then
+                 exit 0
+             fi
+         fi
+         exit 1' >/dev/null 2>&1
+}
+
+boot_stage() {
+    # Order matters: later matches override earlier ones.
+    rsh 'f=/var/log/portal/sglang.log
+         [ -f "$f" ] || { echo "waiting for sglang log"; exit 0; }
+         stage="starting"
+         grep -q "portal.yaml" "$f" && stage="waiting for portal.yaml"
+         grep -q "provisioning has completed" "$f" && stage="waiting for provisioning"
+         grep -Eqi "download|fetching|will attempt download" "$f" && stage="downloading model"
+         grep -Eq "Load weight|Using model weights format" "$f" && stage="loading weights"
+         grep -Eqi "cuda graph|Capture cuda" "$f" && stage="capturing cuda graphs"
+         grep -Eq "fired up|Uvicorn running|Application startup complete" "$f" && stage="almost ready"
+         echo "$stage"' 2>/dev/null || echo "starting"
+}
+
+# returns 0 when the api answers; FAIL_REASON set on crash/timeout
 wait_ready() {
     local deadline=$((SECONDS + READY_TIMEOUT))
-    local mem log
+    local mem stage last_stage=""
     FAIL_REASON=""
     while ((SECONDS < deadline)); do
         if server_ready; then
             c_green "SGLang API is up"
             return 0
         fi
-        if ! sglang_alive; then
-            FAIL_REASON=$(sglang_log_snip || echo "no log found on instance")
+
+        if sglang_crashed; then
+            FAIL_REASON=$(sglang_log_snip || echo "sglang crashed; no log found")
             return 1
         fi
 
+        stage=$(boot_stage)
         mem=$(rsh 'nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1' || echo "?")
-        printf '[%s] waiting for SGLang API  (GPU %s MiB)\n' "$(date +%H:%M:%S)" "$mem" >&2
+        if [[ "$stage" != "$last_stage" ]]; then
+            c_yellow "[$(date +%H:%M:%S)] $stage  (GPU ${mem} MiB)"
+            last_stage="$stage"
+        else
+            printf '[%s] still: %s  (GPU %s MiB)\n' "$(date +%H:%M:%S)" "$stage" "$mem" >&2
+        fi
         sleep 15
     done
-    FAIL_REASON="timed out after ${READY_TIMEOUT}s"
-    log=$(sglang_log_snip || true)
-    [[ -n "$log" ]] && FAIL_REASON="$FAIL_REASON"$'\n'"$log"
+    FAIL_REASON="timed out after ${READY_TIMEOUT}s"$'\n'"$(sglang_log_snip || true)"
     return 1
 }
 
@@ -97,11 +127,20 @@ main() {
     wait_ssh
     rsh 'cat > /root/bench.py' <bench.py
 
-    c_yellow "waiting for template boot serve ($MODEL via SGLang EAGLE)"
+    c_yellow "waiting for boot serve ($MODEL via SGLang EAGLE; args set at create)"
     if ! wait_ready; then
         c_red "SGLang failed to start"
         printf '%s\n' "$FAIL_REASON" >&2
         die "template boot config did not come up; see logs on the instance"
+    fi
+
+    # Stock Qwen3.8 template rejects Claude Code mid-conversation system messages.
+    # Upload patched jinja + restart once if needed, then wait for API again.
+    ensure_chat_template
+    if ! wait_ready; then
+        c_red "SGLang failed after applying chat template"
+        printf '%s\n' "$FAIL_REASON" >&2
+        die "chat-template restart did not come up; see logs on the instance"
     fi
 
     tps=$(benchmark) || tps=""
@@ -115,6 +154,7 @@ main() {
     state_set best_rung "boot"
     record_proxy_ports
     c_green "server ready on the instance; next: ./3-tunnel.sh"
+    c_yellow "prometheus metrics: http://127.0.0.1:$REMOTE_PORT/metrics (via tunnel: http://localhost:$LOCAL_PORT/metrics)"
 }
 
 main "$@"

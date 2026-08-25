@@ -15,11 +15,20 @@ main() {
     require_instance
     resolve_ssh || die "could not resolve ssh url for $INSTANCE_ID"
 
-    c_yellow "checking the vllm api on the instance..."
+    c_yellow "checking the API on the instance (profile=$PROFILE)..."
     local deadline=$((SECONDS + 900))
     until rsh "curl -sf --max-time 5 http://127.0.0.1:$REMOTE_PORT/v1/models" >/dev/null 2>&1; do
-        ((SECONDS < deadline)) || die "vllm never answered; run ./2-serve.sh first"
+        ((SECONDS < deadline)) || die "API never answered; run ./2-serve.sh first"
         printf '[%s] api not ready yet...\n' "$(date +%H:%M:%S)" >&2
+        sleep 8
+    done
+
+    # Belt-and-suspenders for instances that skipped 2-serve after the Claude fix.
+    ensure_chat_template
+    deadline=$((SECONDS + 900))
+    until rsh "curl -sf --max-time 5 http://127.0.0.1:$REMOTE_PORT/v1/models" >/dev/null 2>&1; do
+        ((SECONDS < deadline)) || die "API never answered after chat-template apply"
+        printf '[%s] api not ready yet (after chat-template)...\n' "$(date +%H:%M:%S)" >&2
         sleep 8
     done
 
@@ -31,6 +40,7 @@ main() {
 
     trap on_exit EXIT
     c_green "tunnel up:  http://localhost:$LOCAL_PORT/v1"
+    c_green "metrics:    http://localhost:$LOCAL_PORT/metrics"
     c_green "local proxy port: $LOCAL_PORT"
     c_green "model:      $MODEL"
     c_green "api key:    any non-empty value, e.g. x"
