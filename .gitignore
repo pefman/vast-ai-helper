@@ -1,1 +1,4 @@
 __pycache__/
+.env
+.firecrawl/
+node_modules/

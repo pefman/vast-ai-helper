@@ -48,8 +48,9 @@ profile’s model id and any non-empty API key.
 
 `2-serve.sh` / `3-tunnel.sh` also upload `chat-templates/qwen38-claude.jinja`
 and pass it to SGLang via `--chat-template`. Stock Qwen3.8 templates reject
-Claude Code’s mid-conversation `system`/`developer` messages; the patched
-template renders them instead of raising.
+Claude Code’s mid-conversation `system`/`developer` messages and
+`reasoning_effort=high`; the patched template accepts those instead of raising
+(which otherwise shows up as HTTP 500 on `/v1/messages`).
 
 SGLang Prometheus metrics are enabled at create (`--enable-metrics`) and
 available at `http://localhost:8000/metrics` once the tunnel is up.

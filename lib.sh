@@ -44,8 +44,8 @@ apply_profile() {
             # Template: https://cloud.vast.ai/?template_id=12c8baa67b6b269becbc51634b6c740c&instanceDiskSizeMin=65
             # Stock template uses context 65536 + mem 0.90 which OOMs the hybrid GDN
             # state pool on a 32GB 5090 once EAGLE draft weights load. Profile args
-            # (passed at create via --env) match the SGLang cookbook RTX 5090
-            # envelope (32k ctx, mem 0.93, bs=1) and enable Prometheus /metrics.
+            # keep mem 0.93 / bs=1 / FP8 KV / EAGLE, but raise ctx to 48k (from the
+            # cookbook 32k) — ~3 Gi free at 32k suggests room; 64k still known-bad.
             PROFILE="qwen38-sglang"
             PROFILE_DESC="$(profile_desc "$id")"
             TEMPLATE_HASH="12c8baa67b6b269becbc51634b6c740c"
@@ -53,7 +53,7 @@ apply_profile() {
             MODEL="RadixArk/Qwen3.8-27B-NVFP4"
             DISK_GB=65
             OFFER_QUERY='gpu_name=RTX_5090 num_gpus=1 cuda_max_good>=13.0 disk_space>=65 rented=False reliability>0.95 inet_down>=500 dlperf>180'
-            SGLANG_ARGS='--trust-remote-code --attention-backend flashinfer --reasoning-parser qwen3 --tool-call-parser qwen3_coder --download-dir /workspace/models --host 127.0.0.1 --port 18000 --context-length 32768 --mem-fraction-static 0.93 --kv-cache-dtype fp8_e4m3 --chunked-prefill-size 2048 --max-running-requests 1 --cuda-graph-max-bs 1 --mm-feature-transport cpu --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --enable-linear-replayssm-spec --enable-metrics'
+            SGLANG_ARGS='--trust-remote-code --attention-backend flashinfer --reasoning-parser qwen3 --tool-call-parser qwen3_coder --download-dir /workspace/models --host 127.0.0.1 --port 18000 --context-length 49152 --mem-fraction-static 0.93 --kv-cache-dtype fp8_e4m3 --chunked-prefill-size 2048 --max-running-requests 1 --cuda-graph-max-bs 1 --mm-feature-transport cpu --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --enable-linear-replayssm-spec --enable-metrics'
             REMOTE_PORT=18000
             LOCAL_PORT=8000
             ;;
@@ -342,11 +342,16 @@ rsh() {
 }
 
 # Upload the Claude-compatible Qwen chat template and make SGLang use it.
-# Safe to call repeatedly. Restarts sglang only when the running server is not
-# already using --chat-template pointing at CHAT_TEMPLATE_REMOTE.
+# Safe to call repeatedly. Restarts sglang when the running server is not using
+# --chat-template pointing at CHAT_TEMPLATE_REMOTE, or when the remote file
+# content changed (SGLang loads the jinja at startup).
 ensure_chat_template() {
     [[ -n "${SSH_HOST:-}" && -n "${SSH_PORT:-}" ]] || die "ensure_chat_template: ssh not resolved"
     [[ -f "$CHAT_TEMPLATE_FILE" ]] || die "missing chat template: $CHAT_TEMPLATE_FILE"
+
+    local local_sum remote_sum need_restart=0
+    local_sum=$(sha256sum "$CHAT_TEMPLATE_FILE" | awk '{print $1}')
+    remote_sum=$(rsh "bash --noprofile --norc -c 'sha256sum ${CHAT_TEMPLATE_REMOTE} 2>/dev/null | awk \"{print \\\$1}\"'" 2>/dev/null || true)
 
     c_yellow "ensuring Claude-compatible chat template on instance..."
     scp -P "$SSH_PORT" "${ssh_opts[@]}" \
@@ -355,12 +360,21 @@ ensure_chat_template() {
     # Vast's sglang.sh appends contents of /etc/sglang-args.conf to the serve cmdline.
     rsh "bash --noprofile --norc -c 'printf \"%s\\n\" \"$SGLANG_CHAT_TEMPLATE_ARG\" > /etc/sglang-args.conf'"
 
-    if rsh "bash --noprofile --norc -c '
+    if [[ -z "$remote_sum" || "$remote_sum" != "$local_sum" ]]; then
+        c_yellow "chat template content changed (or missing on remote)"
+        need_restart=1
+    fi
+
+    if ! rsh "bash --noprofile --norc -c '
         pid=\$(pgrep -n -f \"sglang serve\" || true)
         [ -n \"\$pid\" ] || exit 1
         tr \"\\0\" \" \" < /proc/\$pid/cmdline | grep -q -- \"--chat-template ${CHAT_TEMPLATE_REMOTE}\"
       '" >/dev/null 2>&1; then
-        c_green "SGLang already using $CHAT_TEMPLATE_REMOTE"
+        need_restart=1
+    fi
+
+    if (( need_restart == 0 )); then
+        c_green "SGLang already using up-to-date $CHAT_TEMPLATE_REMOTE"
         return 0
     fi
 

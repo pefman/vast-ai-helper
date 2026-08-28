@@ -45,11 +45,12 @@
 {%- set reasoning_instructions = '' %}
 {%- if enable_thinking is undefined or enable_thinking is true %}
     {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}
-    {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}
-        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh (default), medium, and low.') }}
+    {#- Claude Code sends "high"; stock Qwen also uses it. Accept alongside xhigh/medium/low. -#}
+    {%- if resolved_reasoning_effort not in ('xhigh', 'high', 'medium', 'low') %}
+        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh (default), high, medium, and low.') }}
     {%- endif %}
-    {%- if resolved_reasoning_effort == 'xhigh' %}
-        {%- set reasoning_instructions = 'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}
+    {%- if resolved_reasoning_effort == 'xhigh' or resolved_reasoning_effort == 'high' %}
+        {%- set reasoning_instructions = 'Reasoning effort is set to ' ~ resolved_reasoning_effort ~ '. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}
     {%- elif resolved_reasoning_effort == 'low' %}
         {%- set reasoning_instructions = 'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}
     {%- endif %}
